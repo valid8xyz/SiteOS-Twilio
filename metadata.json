@@ -1,0 +1,8 @@
+{
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation"
+  ],
+  "name": "SiteOS Voice PWA",
+  "description": "Secure Voice & AI Communications for Hotel Staff"
+}
