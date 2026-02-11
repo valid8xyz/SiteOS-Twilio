@@ -54,7 +54,8 @@ import {
   Power,
   Bug,
   Terminal,
-  Volume2
+  Volume2,
+  Shuffle
 } from 'lucide-react';
 
 // --- Global Types for Twilio & Google Maps ---
@@ -99,6 +100,7 @@ interface CallLog {
   direction: 'inbound' | 'outbound';
   timestamp: Date;
   duration: number;
+  redirectedFrom?: string;
 }
 
 interface AudioDevice {
@@ -430,7 +432,7 @@ const UserMap = ({ users, center, zoom = 18, historyPath }: { users: Contact[], 
 
 // --- Independent Hooks ---
 
-// 1. Audio Devices Hook (Separated from Twilio logic)
+// 1. Audio Devices Hook
 const useAudioDevices = () => {
   const [inputDevices, setInputDevices] = useState<AudioDevice[]>([]);
   const [outputDevices, setOutputDevices] = useState<AudioDevice[]>([]);
@@ -438,9 +440,10 @@ const useAudioDevices = () => {
 
   const getDevices = useCallback(async () => {
     try {
-      // Prompt for permission if not already granted to ensure labels are visible
       if (!permissionGranted) {
-         await navigator.mediaDevices.getUserMedia({ audio: true });
+         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+         // Important: Stop the stream immediately so we don't keep the mic open just for listing devices
+         stream.getTracks().forEach(track => track.stop());
          setPermissionGranted(true);
       }
       
@@ -464,10 +467,7 @@ const useAudioDevices = () => {
   }, [permissionGranted]);
 
   useEffect(() => {
-    // Initial fetch
     getDevices();
-    
-    // Listener for hardware changes (plugging in headset)
     navigator.mediaDevices.addEventListener('devicechange', getDevices);
     return () => navigator.mediaDevices.removeEventListener('devicechange', getDevices);
   }, [getDevices]);
@@ -510,7 +510,12 @@ const useGeolocationHeartbeat = (config: SystemConfig, currentUser: AppUser | nu
 };
 
 // 3. Twilio Voice Hook
-const useTwilioVoice = (token: string | null, onTokenExpired?: () => void) => {
+const useTwilioVoice = (
+  token: string | null, 
+  onTokenExpired: () => void,
+  selectedMic: string,
+  selectedSpeaker: string
+) => {
   const [device, setDevice] = useState<any>(null);
   const [deviceReady, setDeviceReady] = useState(false);
   const [callState, setCallState] = useState<CallState>('idle');
@@ -519,6 +524,35 @@ const useTwilioVoice = (token: string | null, onTokenExpired?: () => void) => {
   const [error, setError] = useState<string | null>(null);
   const [callDuration, setCallDuration] = useState(0);
   const timerRef = useRef<any>(null);
+
+  // Apply audio device settings whenever device is ready or selection changes
+  useEffect(() => {
+    if(device && deviceReady) {
+       if(selectedMic && device.audio) {
+          device.audio.setInputDevice(selectedMic);
+       }
+       if(selectedSpeaker && device.audio && device.audio.speaker) {
+          device.audio.speaker.setAudioOutputDevice(selectedSpeaker);
+       }
+    }
+  }, [device, deviceReady, selectedMic, selectedSpeaker]);
+
+  // Expose manual setters for device management
+  const setAudioInput = useCallback((deviceId: string) => {
+    if (device && device.audio) {
+       try {
+         device.audio.setInputDevice(deviceId);
+       } catch (e) { console.warn("Failed to set input device", e); }
+    }
+  }, [device]);
+
+  const setAudioOutput = useCallback((deviceId: string) => {
+    if (device && device.audio && device.audio.speaker) {
+        try {
+          device.audio.speaker.setAudioOutputDevice(deviceId);
+        } catch (e) { console.warn("Failed to set output device", e); }
+    }
+  }, [device]);
 
   useEffect(() => {
     if (!token || !window.Twilio) {
@@ -545,7 +579,7 @@ const useTwilioVoice = (token: string | null, onTokenExpired?: () => void) => {
 
     newDevice.on('error', (err: any) => {
       console.error('Twilio Device Error:', err);
-      setError(err.message || 'Twilio Error');
+      setError(`${err.message} (${err.code})`);
       if (err.code === 31205) { // Token expired
          setDeviceReady(false);
          if (onTokenExpired) onTokenExpired();
@@ -581,15 +615,26 @@ const useTwilioVoice = (token: string | null, onTokenExpired?: () => void) => {
     return () => clearInterval(timerRef.current);
   }, [callState]);
 
-  const makeCall = useCallback((number: string) => {
+  const makeCall = useCallback((number: string, identity?: string, siteId?: string) => {
     if (!device) return;
     const formattedNumber = formatPhoneNumber(number);
     setCallState('dialing');
-    const connection = device.connect({ params: { To: formattedNumber, AgentId: MOCK_ADMIN_USER.id } });
+    
+    const connection = device.connect({ 
+        To: formattedNumber, 
+        AgentId: identity || 'Unknown',
+        SiteId: siteId || 'site_alpha'
+    });
+    
     setActiveConnection(connection);
+    
     connection.on('accept', () => setCallState('connected'));
     connection.on('disconnect', () => { setCallState('idle'); setActiveConnection(null); });
-    connection.on('error', (e: any) => { setCallState('idle'); setActiveConnection(null); setError("Call failed: " + e.message); });
+    connection.on('error', (e: any) => { 
+        setCallState('idle'); 
+        setActiveConnection(null); 
+        setError("Call failed: " + e.message); 
+    });
   }, [device]);
 
   const endCall = useCallback(() => {
@@ -617,14 +662,6 @@ const useTwilioVoice = (token: string | null, onTokenExpired?: () => void) => {
       setCallState('idle');
     }
   }, [incomingConnection]);
-  
-  const setAudioInput = useCallback((deviceId: string) => {
-     if(device && device.audio) device.audio.setInputDevice(deviceId);
-  }, [device]);
-
-  const setAudioOutput = useCallback((deviceId: string) => {
-     if(device && device.audio && device.audio.speaker) device.audio.speaker.setAudioOutputDevice(deviceId);
-  }, [device]);
 
   return {
     device, deviceReady, callState, callDuration, error,
@@ -642,12 +679,15 @@ const SettingsView = ({
   outputDevices, 
   setAudioInput, 
   setAudioOutput, 
+  selectedMic,
+  selectedSpeaker,
   refreshDevices,
   systemConfig, 
   setSystemConfig,
   isDeviceReady, 
   onRefreshConnection,
-  geoState
+  geoState,
+  lastError
 }: { 
   user: AppUser, 
   handleLogout: () => void, 
@@ -656,12 +696,15 @@ const SettingsView = ({
   outputDevices: AudioDevice[], 
   setAudioInput: (id: string) => void, 
   setAudioOutput: (id: string) => void, 
+  selectedMic: string,
+  selectedSpeaker: string,
   refreshDevices: () => void,
   systemConfig: SystemConfig, 
   setSystemConfig: (c: SystemConfig) => void,
   isDeviceReady: boolean, 
   onRefreshConnection: (i: string) => void,
-  geoState: { location: { lat: number, lng: number } | null, isWithinFence: boolean | null }
+  geoState: { location: { lat: number, lng: number } | null, isWithinFence: boolean | null },
+  lastError: string | null
 }) => {
    
    const [localEndpoint, setLocalEndpoint] = useState(systemConfig.tokenEndpoint);
@@ -726,6 +769,14 @@ const SettingsView = ({
                         {isDeviceReady ? 'Connected' : 'Offline'}
                      </span>
                   </div>
+                  
+                  {lastError && (
+                     <div className="p-3 bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-lg">
+                        <p className="text-xs text-rose-600 dark:text-rose-300 font-mono flex items-center gap-1">
+                           <AlertCircle className="w-3 h-3" /> {lastError}
+                        </p>
+                     </div>
+                  )}
                   
                   {/* Connection Diagnostics */}
                   <div className="bg-slate-50 dark:bg-slate-900 rounded-xl p-3 space-y-3 mt-2 border border-slate-200 dark:border-slate-700">
@@ -793,8 +844,8 @@ const SettingsView = ({
                      <label className="block text-xs font-bold text-slate-500 mb-2 flex items-center gap-2">
                         <Mic className="w-3 h-3" /> Microphone
                      </label>
-                     <select onChange={e => setAudioInput(e.target.value)} className="w-full p-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm dark:text-white">
-                        {inputDevices.length === 0 && <option>No inputs found</option>}
+                     <select value={selectedMic} onChange={e => setAudioInput(e.target.value)} className="w-full p-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm dark:text-white">
+                        {inputDevices.length === 0 && <option value="">No inputs found</option>}
                         {inputDevices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label}</option>)}
                      </select>
                   </div>
@@ -802,8 +853,8 @@ const SettingsView = ({
                      <label className="block text-xs font-bold text-slate-500 mb-2 flex items-center gap-2">
                         <Volume2 className="w-3 h-3" /> Speaker
                      </label>
-                     <select onChange={e => setAudioOutput(e.target.value)} className="w-full p-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm dark:text-white">
-                        {outputDevices.length === 0 && <option>No outputs found</option>}
+                     <select value={selectedSpeaker} onChange={e => setAudioOutput(e.target.value)} className="w-full p-2 rounded-lg bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm dark:text-white">
+                        {outputDevices.length === 0 && <option value="">No outputs found</option>}
                         {outputDevices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label}</option>)}
                      </select>
                   </div>
@@ -822,6 +873,7 @@ const SettingsView = ({
    );
 };
 
+// ... (Rest of components NavButton, DialerView, etc. remain unchanged from previous correct output) ...
 const NavButton = ({ icon: Icon, label, active, onClick, mobile }: { icon: any, label: string, active: boolean, onClick: () => void, mobile?: boolean }) => (
   <button 
     onClick={onClick}
@@ -832,7 +884,7 @@ const NavButton = ({ icon: Icon, label, active, onClick, mobile }: { icon: any, 
   </button>
 );
 
-const DialerView = ({ dialString, setDialString, handleCallStart, deviceReady, activeView, setActiveView, history, clearHistory, retryConnection }: any) => {
+const DialerView = ({ dialString, setDialString, handleCallStart, deviceReady, activeView, setActiveView, history, clearHistory, retryConnection, error }: any) => {
   const handleKeypad = (val: string) => {
     if (dialString.length < 15) setDialString((prev: string) => prev + val);
   };
@@ -875,8 +927,11 @@ const DialerView = ({ dialString, setDialString, handleCallStart, deviceReady, a
         </div>
         
         {!deviceReady && (
-           <div className="mt-4 flex items-center gap-2 text-rose-500 text-sm font-bold cursor-pointer" onClick={retryConnection}>
-              <WifiOff className="w-4 h-4" /> Service Offline (Tap to Retry)
+           <div className="mt-4 flex flex-col items-center gap-2 cursor-pointer" onClick={retryConnection}>
+              <div className="flex items-center gap-2 text-rose-500 text-sm font-bold">
+                  <WifiOff className="w-4 h-4" /> Service Offline (Tap to Retry)
+              </div>
+              {error && <span className="text-[10px] text-rose-400 bg-rose-50 dark:bg-rose-900/20 px-2 py-1 rounded max-w-[200px] text-center truncate">{error}</span>}
            </div>
         )}
       </div>
@@ -904,8 +959,15 @@ const DialerView = ({ dialString, setDialString, handleCallStart, deviceReady, a
                         <div className="text-xs text-slate-500">{log.number}</div>
                      </div>
                   </div>
-                  <div className="text-xs text-slate-400 font-mono">
-                     {log.timestamp.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                  <div className="flex flex-col items-end gap-1">
+                     <div className="text-xs text-slate-400 font-mono">
+                        {log.timestamp.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                     </div>
+                     {log.redirectedFrom && (
+                        <span className="text-[8px] bg-amber-100 text-amber-700 px-1 rounded flex items-center gap-0.5">
+                           <Shuffle className="w-2 h-2" /> Route
+                        </span>
+                     )}
                   </div>
                </div>
             ))}
@@ -915,141 +977,110 @@ const DialerView = ({ dialString, setDialString, handleCallStart, deviceReady, a
   );
 };
 
+// ... (Keep ContactsView, AdminView, SetupView, GuestKioskView as they were) ...
 const ContactsView = ({ user, setDialString, setActiveView }: any) => {
+  const [filter, setFilter] = useState('');
+  const filteredContacts = MOCK_CONTACTS.filter(c => c.name.toLowerCase().includes(filter.toLowerCase()) || c.role.toLowerCase().includes(filter.toLowerCase()));
   return (
-    <div className="h-full bg-slate-50 dark:bg-slate-900 p-6 overflow-y-auto">
-       <h2 className="text-2xl font-bold mb-6 dark:text-white">Contacts</h2>
-       
-       <div className="mb-6">
+    <div className="h-full flex flex-col bg-slate-50 dark:bg-slate-900 animate-in slide-in-from-right-4 duration-300">
+       <div className="p-4 bg-white dark:bg-slate-800 shadow-sm z-10">
+          <h2 className="text-2xl font-bold mb-4 dark:text-white">Contacts</h2>
           <div className="relative">
-             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-5 h-5" />
-             <input type="text" placeholder="Search team..." className="w-full pl-10 pr-4 py-3 rounded-xl bg-white dark:bg-slate-800 border-none shadow-sm outline-none text-slate-900 dark:text-white" />
+             <Search className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
+             <input type="text" placeholder="Search team..." value={filter} onChange={e => setFilter(e.target.value)} className="w-full pl-10 pr-4 py-3 bg-slate-100 dark:bg-slate-700 rounded-xl outline-none focus:ring-2 focus:ring-indigo-500 dark:text-white transition-all" />
           </div>
        </div>
-
-       <div className="space-y-3">
-          {MOCK_CONTACTS.map(contact => (
-             <div key={contact.id} className="bg-white dark:bg-slate-800 p-4 rounded-xl shadow-sm flex items-center justify-between hover:shadow-md transition-shadow cursor-pointer" onClick={() => { setDialString(contact.phone); setActiveView('dialer'); }}>
-                <div className="flex items-center gap-4">
-                   <div className="relative">
-                      <div className="w-12 h-12 rounded-full bg-indigo-100 dark:bg-slate-700 flex items-center justify-center font-bold text-indigo-600 dark:text-indigo-400">
-                         {contact.avatar}
-                      </div>
-                      <div className="absolute bottom-0 right-0">
-                         <StatusIndicator status={contact.status} />
-                      </div>
-                   </div>
-                   <div>
-                      <h3 className="font-bold text-slate-900 dark:text-white">{contact.name}</h3>
-                      <div className="flex items-center gap-2 text-xs text-slate-500">
-                         <span className="capitalize bg-slate-100 dark:bg-slate-700 px-2 py-0.5 rounded text-slate-600 dark:text-slate-300">{contact.role}</span>
-                         {contact.lastSeen && <span>• {contact.lastSeen}</span>}
-                      </div>
+       <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          {filteredContacts.map(contact => (
+             <div key={contact.id} onClick={() => { setDialString(contact.phone); setActiveView('dialer'); }} className="flex items-center gap-4 p-4 bg-white dark:bg-slate-800 rounded-2xl shadow-sm hover:shadow-md transition-all cursor-pointer group border border-slate-100 dark:border-slate-700">
+                <div className="w-12 h-12 rounded-full bg-slate-100 dark:bg-slate-700 flex items-center justify-center text-lg font-bold text-slate-600 dark:text-slate-300 relative">
+                   {contact.avatar}
+                   <div className="absolute bottom-0 right-0"><StatusIndicator status={contact.status} /></div>
+                </div>
+                <div className="flex-1">
+                   <h3 className="font-bold text-slate-900 dark:text-white">{contact.name}</h3>
+                   <div className="flex items-center gap-2 text-xs text-slate-500">
+                      <span className="capitalize px-2 py-0.5 bg-slate-100 dark:bg-slate-700 rounded">{contact.role}</span>
+                      {contact.location && <span className="flex items-center gap-1"><MapPin className="w-3 h-3"/> On Site</span>}
                    </div>
                 </div>
-                <button className="w-10 h-10 rounded-full bg-indigo-50 dark:bg-slate-700 text-indigo-600 dark:text-indigo-400 flex items-center justify-center hover:bg-indigo-100 dark:hover:bg-slate-600">
-                   <Phone className="w-5 h-5" />
-                </button>
+                <button className="p-3 rounded-full bg-indigo-50 text-indigo-600 dark:bg-indigo-900/20 dark:text-indigo-400 opacity-0 group-hover:opacity-100 transition-opacity"><Phone className="w-5 h-5" /></button>
              </div>
           ))}
+          <div className="mt-6 h-64 rounded-2xl overflow-hidden shadow-lg border border-slate-200 dark:border-slate-700 relative">
+             <UserMap users={filteredContacts} center={{ lat: DEFAULT_SYSTEM_CONFIG.siteLat, lng: DEFAULT_SYSTEM_CONFIG.siteLng }} />
+             <div className="absolute top-2 left-2 bg-white/90 dark:bg-slate-900/90 backdrop-blur px-3 py-1 rounded-lg text-xs font-bold shadow">Live Team Map</div>
+          </div>
        </div>
     </div>
   );
 };
 
 const AdminView = ({ setGeneratedQrToken, generatedQrToken, routingRules, setRoutingRules, systemConfig, setSystemConfig }: any) => {
+   const [activeTab, setActiveTab] = useState<'routing' | 'system'>('routing');
    return (
-      <div className="h-full bg-slate-50 dark:bg-slate-900 p-6 overflow-y-auto">
-         <h2 className="text-2xl font-bold mb-6 dark:text-white flex items-center gap-2">
-            <Shield className="w-6 h-6 text-indigo-600" /> Admin Console
-         </h2>
-         
-         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl shadow-sm">
-               <h3 className="font-bold text-lg mb-4 dark:text-white">Call Routing Rules</h3>
+      <div className="h-full flex flex-col bg-slate-50 dark:bg-slate-900 animate-in slide-in-from-right-4 duration-300">
+         <div className="p-6 bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700">
+            <h2 className="text-2xl font-bold mb-4 dark:text-white flex items-center gap-2"><Shield className="w-6 h-6 text-indigo-600" /> Admin Console</h2>
+            <div className="flex gap-4">
+               <button onClick={() => setActiveTab('routing')} className={`pb-2 text-sm font-bold border-b-2 transition-colors ${activeTab === 'routing' ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-slate-500'}`}>Call Routing</button>
+               <button onClick={() => setActiveTab('system')} className={`pb-2 text-sm font-bold border-b-2 transition-colors ${activeTab === 'system' ? 'border-indigo-600 text-indigo-600' : 'border-transparent text-slate-500'}`}>System Config</button>
+            </div>
+         </div>
+         <div className="flex-1 overflow-y-auto p-6">
+            {activeTab === 'routing' ? (
                <div className="space-y-4">
+                  <div className="flex justify-between items-center mb-4">
+                     <p className="text-sm text-slate-500">Manage intelligent call routing rules.</p>
+                     <button className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-bold hover:bg-indigo-700 transition-colors"><Plus className="w-4 h-4" /> New Rule</button>
+                  </div>
                   {routingRules.map((rule: RoutingRule) => (
-                     <div key={rule.id} className="border border-slate-100 dark:border-slate-700 p-4 rounded-xl">
+                     <div key={rule.id} className="p-4 bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700">
                         <div className="flex justify-between items-start mb-2">
-                           <h4 className="font-bold text-sm dark:text-white">{rule.name}</h4>
-                           <div className={`w-8 h-4 rounded-full p-0.5 cursor-pointer ${rule.isActive ? 'bg-emerald-500' : 'bg-slate-300'}`} onClick={() => {
-                               const updated = routingRules.map((r: RoutingRule) => r.id === rule.id ? {...r, isActive: !r.isActive} : r);
-                               setRoutingRules(updated);
-                           }}>
-                              <div className={`w-3 h-3 bg-white rounded-full shadow-sm transition-transform ${rule.isActive ? 'translate-x-4' : 'translate-x-0'}`} />
+                           <div>
+                              <h3 className="font-bold text-slate-900 dark:text-white flex items-center gap-2">{rule.name} {rule.isActive ? <span className="w-2 h-2 rounded-full bg-emerald-500"/> : <span className="w-2 h-2 rounded-full bg-slate-300"/>}</h3>
+                              <p className="text-xs text-slate-500 mt-1">{rule.description}</p>
                            </div>
+                           <button onClick={() => setRoutingRules(routingRules.map((r: any) => r.id === rule.id ? {...r, isActive: !r.isActive} : r))} className={`w-10 h-6 rounded-full p-1 transition-colors ${rule.isActive ? 'bg-indigo-600' : 'bg-slate-300'}`}><div className={`w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${rule.isActive ? 'translate-x-4' : ''}`} /></button>
                         </div>
-                        <p className="text-xs text-slate-500 mb-2">{rule.description}</p>
-                        <div className="flex gap-2 text-[10px] font-mono text-slate-400">
-                           <span className="bg-slate-50 dark:bg-slate-900 px-2 py-1 rounded">IF {rule.criteria.targetRole === 'any' ? 'User' : rule.criteria.targetRole} is {rule.criteria.targetStatus}</span>
-                           <span className="bg-slate-50 dark:bg-slate-900 px-2 py-1 rounded">THEN {rule.action.redirectName}</span>
+                        <div className="flex flex-wrap gap-2 mt-3">
+                           <span className="text-[10px] font-mono bg-slate-100 dark:bg-slate-700 px-2 py-1 rounded border border-slate-200 dark:border-slate-600">IF role={rule.criteria.targetRole} & status={rule.criteria.targetStatus}</span>
+                           <ArrowRight className="w-3 h-3 text-slate-400 self-center" />
+                           <span className="text-[10px] font-mono bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 px-2 py-1 rounded border border-indigo-100 dark:border-indigo-800">REDIRECT {rule.action.redirectName}</span>
                         </div>
                      </div>
                   ))}
                </div>
-            </div>
-            
-            <div className="space-y-6">
-                <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl shadow-sm">
-                   <h3 className="font-bold text-lg mb-4 dark:text-white">Provisioning</h3>
-                   <p className="text-sm text-slate-500 mb-4">Generate QR codes for staff quick login.</p>
-                   <button 
-                     onClick={() => setGeneratedQrToken('staff_id_2')} // Mock ID
-                     className="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-bold w-full"
-                   >
-                      Generate Staff Token (John Smith)
-                   </button>
-                   {generatedQrToken && (
-                      <div className="mt-4 p-4 bg-slate-100 dark:bg-slate-900 rounded-xl flex flex-col items-center">
-                         <QrCode className="w-32 h-32 text-slate-900 dark:text-white" />
-                         <p className="mt-2 text-xs font-mono text-slate-500 break-all">{window.location.origin}/?setup_token={generatedQrToken}</p>
-                      </div>
-                   )}
-                </div>
-
-                <div className="bg-white dark:bg-slate-800 p-6 rounded-2xl shadow-sm">
-                   <h3 className="font-bold text-lg mb-4 dark:text-white">System Config</h3>
-                   <div className="space-y-3">
-                      <div>
-                         <label className="text-xs font-bold text-slate-500">Site Name</label>
-                         <input type="text" value={systemConfig.siteName} onChange={e => setSystemConfig({...systemConfig, siteName: e.target.value})} className="w-full p-2 text-sm border border-slate-200 dark:border-slate-700 rounded-lg dark:bg-slate-900 dark:text-white" />
-                      </div>
-                      <div>
-                         <label className="text-xs font-bold text-slate-500">Emergency Number</label>
-                         <input type="text" value={systemConfig.emergencyNumber} onChange={e => setSystemConfig({...systemConfig, emergencyNumber: e.target.value})} className="w-full p-2 text-sm border border-slate-200 dark:border-slate-700 rounded-lg dark:bg-slate-900 dark:text-white" />
-                      </div>
-                   </div>
-                </div>
-            </div>
+            ) : (
+               <div className="space-y-6 max-w-2xl">
+                  <div className="bg-white dark:bg-slate-800 p-4 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700">
+                     <h3 className="font-bold mb-4 flex items-center gap-2 text-sm uppercase tracking-wider text-slate-500"><MapPin className="w-4 h-4" /> Site Geofence</h3>
+                     <div className="grid grid-cols-2 gap-4">
+                        <div><label className="block text-xs font-bold text-slate-400 mb-1">Site Name</label><input type="text" value={systemConfig.siteName} onChange={(e) => setSystemConfig({...systemConfig, siteName: e.target.value})} className="w-full p-2 bg-slate-50 dark:bg-slate-900 rounded border border-slate-200 dark:border-slate-700" /></div>
+                        <div><label className="block text-xs font-bold text-slate-400 mb-1">Radius (m)</label><input type="number" value={systemConfig.radiusMeters} onChange={(e) => setSystemConfig({...systemConfig, radiusMeters: parseInt(e.target.value)})} className="w-full p-2 bg-slate-50 dark:bg-slate-900 rounded border border-slate-200 dark:border-slate-700" /></div>
+                     </div>
+                  </div>
+               </div>
+            )}
          </div>
       </div>
    );
 };
 
 const SetupView = ({ generateSetupLink, generatedQrToken, setGeneratedQrToken }: any) => {
+   const [manualId, setManualId] = useState('');
+   const handleJoin = () => { if(manualId) window.location.search = `?setup_token=staff_id_${manualId}`; };
    return (
-      <div className="h-full flex flex-col items-center justify-center bg-slate-50 dark:bg-slate-900 p-6 text-center">
-         <div className="w-20 h-20 bg-indigo-600 rounded-2xl flex items-center justify-center mb-6 shadow-xl shadow-indigo-500/30">
-            <Radio className="w-10 h-10 text-white" />
-         </div>
-         <h1 className="text-3xl font-bold text-slate-900 dark:text-white mb-2">Welcome to SiteOS</h1>
-         <p className="text-slate-500 mb-8 max-w-sm">Secure Communication Platform for Enterprise Sites.</p>
-         
-         <div className="w-full max-w-md bg-white dark:bg-slate-800 p-8 rounded-3xl shadow-sm">
-            <h2 className="font-bold text-lg mb-4 dark:text-white">Device Setup</h2>
-            <div className="flex flex-col gap-4">
-               <button className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl transition-colors">
-                  Scan Provisioning QR
-               </button>
-               <div className="relative py-2">
-                  <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-200 dark:border-slate-700"></div></div>
-                  <div className="relative flex justify-center text-xs uppercase"><span className="bg-white dark:bg-slate-800 px-2 text-slate-500">Or</span></div>
-               </div>
-               <input type="text" placeholder="Enter Provisioning Token" className="w-full p-3 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl text-center text-sm" />
-               <button className="text-indigo-600 dark:text-indigo-400 text-sm font-bold mt-2">Manual Server Configuration</button>
+      <div className="h-full flex flex-col items-center justify-center bg-slate-50 dark:bg-slate-900 p-6 animate-in zoom-in duration-300">
+         <div className="w-full max-w-md bg-white dark:bg-slate-800 rounded-3xl shadow-xl p-8 text-center border border-slate-100 dark:border-slate-700">
+            <div className="w-20 h-20 bg-indigo-600 rounded-2xl mx-auto flex items-center justify-center mb-6 shadow-lg shadow-indigo-500/30"><Radio className="w-10 h-10 text-white" /></div>
+            <h1 className="text-3xl font-bold text-slate-900 dark:text-white mb-2">Welcome to SiteOS</h1>
+            <p className="text-slate-500 mb-8">Secure communication & safety platform.</p>
+            <div className="space-y-4">
+               <div className="p-4 bg-slate-50 dark:bg-slate-900 rounded-xl border border-slate-100 dark:border-slate-700"><QrCode className="w-12 h-12 text-slate-400 mx-auto mb-2" /><p className="text-xs text-slate-400 font-bold uppercase tracking-wider">Scan Site QR Code</p></div>
+               <div className="flex gap-2"><input type="text" placeholder="e.g. 1 (Admin)" value={manualId} onChange={(e) => setManualId(e.target.value)} className="flex-1 p-3 bg-slate-50 dark:bg-slate-900 rounded-xl outline-none border border-slate-200 dark:border-slate-700" /><button onClick={handleJoin} className="bg-indigo-600 text-white px-6 rounded-xl font-bold hover:bg-indigo-700 transition-colors">Join</button></div>
             </div>
          </div>
-         <p className="mt-8 text-xs text-slate-400">v1.3.0 • Secure Connection</p>
       </div>
    );
 };
@@ -1057,50 +1088,18 @@ const SetupView = ({ generateSetupLink, generatedQrToken, setGeneratedQrToken }:
 const GuestKioskView = ({ handleCallStart, setDialString, emergencyNumber }: any) => {
    return (
       <div className="h-full flex flex-col bg-slate-900 text-white p-6 relative overflow-hidden">
-         {/* Background Decoration */}
-         <div className="absolute top-0 right-0 w-96 h-96 bg-indigo-600/20 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2" />
-         
-         <header className="flex justify-between items-center mb-12 relative z-10">
-            <div>
-               <h1 className="text-3xl font-bold">Good Morning</h1>
-               <p className="text-indigo-200">Room 101 Guest</p>
-            </div>
-            <div className="text-right">
-               <div className="text-2xl font-mono font-bold">{new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</div>
-               <div className="text-sm text-indigo-300">{new Date().toLocaleDateString()}</div>
-            </div>
-         </header>
-
-         <div className="flex-1 grid grid-cols-2 gap-6 relative z-10">
-            <button onClick={() => handleCallStart('100')} className="bg-white/10 hover:bg-white/20 backdrop-blur-lg rounded-3xl p-6 flex flex-col items-center justify-center gap-4 transition-all hover:scale-105 border border-white/10">
-               <div className="w-16 h-16 rounded-full bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/40">
-                  <ConciergeBell className="w-8 h-8 text-white" />
-               </div>
-               <span className="font-bold text-lg">Concierge</span>
+         <div className="absolute top-0 left-0 w-full h-1/2 bg-gradient-to-b from-indigo-900/50 to-transparent pointer-events-none" />
+         <div className="relative z-10 flex flex-col items-center justify-center h-full gap-8 max-w-lg mx-auto w-full">
+            <div className="text-center mb-8"><h1 className="text-4xl font-bold mb-2">How can we help?</h1><p className="text-indigo-200">Tap to connect instantly.</p></div>
+            <button onClick={() => { setDialString('100'); handleCallStart('100'); }} className="w-full p-6 bg-white/10 hover:bg-white/20 backdrop-blur-md rounded-3xl border border-white/10 flex items-center gap-6 transition-all group">
+               <div className="w-16 h-16 rounded-2xl bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/30 group-hover:scale-110 transition-transform"><ConciergeBell className="w-8 h-8 text-white" /></div>
+               <div className="text-left"><h3 className="text-2xl font-bold">Front Desk</h3><p className="text-indigo-200">General inquiries</p></div><ArrowRight className="w-6 h-6 ml-auto opacity-50 group-hover:opacity-100 transition-all" />
             </button>
-            
-            <button onClick={() => handleCallStart('101')} className="bg-white/10 hover:bg-white/20 backdrop-blur-lg rounded-3xl p-6 flex flex-col items-center justify-center gap-4 transition-all hover:scale-105 border border-white/10">
-               <div className="w-16 h-16 rounded-full bg-emerald-500 flex items-center justify-center shadow-lg shadow-emerald-500/40">
-                  <Coffee className="w-8 h-8 text-white" />
-               </div>
-               <span className="font-bold text-lg">Room Service</span>
+            <button onClick={() => { setDialString('AI_AGENT'); handleCallStart('AI_AGENT'); }} className="w-full p-6 bg-gradient-to-r from-violet-600/20 to-fuchsia-600/20 hover:from-violet-600/30 hover:to-fuchsia-600/30 backdrop-blur-md rounded-3xl border border-white/10 flex items-center gap-6 transition-all group">
+               <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-500 to-fuchsia-500 flex items-center justify-center shadow-lg shadow-fuchsia-500/30 group-hover:scale-110 transition-transform"><Bot className="w-8 h-8 text-white" /></div>
+               <div className="text-left"><h3 className="text-2xl font-bold">AI Concierge</h3><p className="text-fuchsia-200">24/7 Recommendations</p></div><Zap className="w-6 h-6 ml-auto text-yellow-400 group-hover:animate-pulse" />
             </button>
-            
-            <button onClick={() => handleCallStart('AI_AGENT')} className="bg-gradient-to-br from-indigo-600 to-purple-600 rounded-3xl p-6 flex flex-col items-center justify-center gap-4 transition-all hover:scale-105 col-span-2 shadow-xl shadow-indigo-600/30">
-               <div className="w-16 h-16 rounded-full bg-white/20 flex items-center justify-center animate-pulse">
-                  <Bot className="w-8 h-8 text-white" />
-               </div>
-               <div className="text-center">
-                  <span className="font-bold text-lg block">AI Assistant</span>
-                  <span className="text-sm text-indigo-200">Ask about amenities, local area & more</span>
-               </div>
-            </button>
-         </div>
-
-         <div className="mt-6 relative z-10">
-            <button onClick={() => handleCallStart(emergencyNumber)} className="w-full py-4 bg-rose-600 hover:bg-rose-700 rounded-2xl font-bold flex items-center justify-center gap-2 shadow-lg shadow-rose-600/30 transition-transform active:scale-95">
-               <AlertCircle className="w-6 h-6" /> Emergency Help ({emergencyNumber})
-            </button>
+            <button onClick={() => { setDialString(emergencyNumber); handleCallStart(emergencyNumber); }} className="w-full mt-auto p-4 bg-rose-500/20 hover:bg-rose-500/30 backdrop-blur-md rounded-2xl border border-rose-500/30 flex items-center justify-center gap-3 transition-all text-rose-300 hover:text-white"><AlertCircle className="w-6 h-6" /><span className="font-bold text-lg">Emergency</span></button>
          </div>
       </div>
    );
@@ -1116,6 +1115,10 @@ const App = () => {
   const [callHistory, setCallHistory] = useState<CallLog[]>([]);
   const [status, setStatus] = useState<UserStatus>('available');
   const [twilioToken, setTwilioToken] = useState<string>('');
+  
+  // Audio State
+  const [selectedMic, setSelectedMic] = useState('');
+  const [selectedSpeaker, setSelectedSpeaker] = useState('');
 
   const [toast, setToast] = useState<{msg:string, type:'success'|'info'|'error'} | null>(null);
   const showToast = (msg: string, type: 'success'|'info'|'error' = 'info') => {
@@ -1124,6 +1127,12 @@ const App = () => {
   };
 
   const fetchTwilioToken = useCallback(async (identity: string) => {
+     // Don't auto-fetch if we have a manual token that looks like a JWT (very long)
+     if(twilioToken.length > 200 && !systemConfig.tokenEndpoint.includes('localhost')) {
+        console.log("Using manual token, skipping fetch");
+        return;
+     }
+
      if(!identity || !systemConfig.tokenEndpoint) return;
      if (!systemConfig.tokenEndpoint.startsWith('http')) {
         console.warn("Invalid Token Endpoint format");
@@ -1159,7 +1168,7 @@ const App = () => {
      } catch(e: any) {
         console.error(e);
      }
-  }, [systemConfig.tokenEndpoint, currentUser]);
+  }, [systemConfig.tokenEndpoint, currentUser, twilioToken]);
 
   // Use separated hooks
   const { inputDevices, outputDevices, getDevices } = useAudioDevices();
@@ -1172,13 +1181,25 @@ const App = () => {
     endCall,
     acceptCall,
     rejectCall,
-    setAudioInput,
+    setAudioInput, // Still needed for dynamic switching
     setAudioOutput,
-    incomingConnection
+    incomingConnection,
+    error: voiceError
   } = useTwilioVoice(twilioToken, () => {
       console.log("Token expired, refreshing...");
       if (currentUser) fetchTwilioToken(currentUser.name);
-  });
+  }, selectedMic, selectedSpeaker);
+
+  // Manual handlers to update app state + device
+  const handleSetAudioInput = (id: string) => {
+     setSelectedMic(id);
+     setAudioInput(id); // Try to set on device immediately
+  };
+  
+  const handleSetAudioOutput = (id: string) => {
+     setSelectedSpeaker(id);
+     setAudioOutput(id);
+  };
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -1205,16 +1226,46 @@ const App = () => {
   }, []);
 
   const handleCallStart = (number?: string) => {
-      const target = number || dialString;
+      let target = number || dialString;
       if (!target) return;
-      makeCall(target);
+      
+      // --- Client-Side Routing Logic (Simulation) ---
+      // 1. Check if target is in contacts
+      const targetContact = MOCK_CONTACTS.find(c => c.phone === target || c.phone.endsWith(target));
+      let redirectedFrom = undefined;
+
+      if (targetContact) {
+         // 2. Check rules
+         const matchedRule = routingRules.find(rule => 
+            rule.isActive &&
+            (rule.criteria.targetRole === 'any' || rule.criteria.targetRole === targetContact.role) &&
+            (rule.criteria.targetStatus === 'any' || rule.criteria.targetStatus === targetContact.status)
+         );
+
+         if (matchedRule) {
+            console.log("Applying Routing Rule:", matchedRule.name);
+            showToast(`Rerouting: ${matchedRule.name}`, 'info');
+            redirectedFrom = target;
+            target = matchedRule.action.redirectNumber;
+            // Short delay to show the user what happened
+            setTimeout(() => {
+               makeCall(target, currentUser?.name, currentUser?.siteId);
+            }, 800);
+         } else {
+            makeCall(target, currentUser?.name, currentUser?.siteId);
+         }
+      } else {
+         makeCall(target, currentUser?.name, currentUser?.siteId);
+      }
+
       setCallHistory(prev => [{
           id: Date.now().toString(),
           number: target,
           name: MOCK_CONTACTS.find(c => c.phone === target)?.name || 'Unknown',
           direction: 'outbound',
           timestamp: new Date(),
-          duration: 0
+          duration: 0,
+          redirectedFrom
       }, ...prev]);
   };
 
@@ -1228,168 +1279,62 @@ const App = () => {
 
   return (
     <div className="h-screen w-screen bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-white flex overflow-hidden font-sans select-none">
-       {/* Sidebar Navigation */}
        <aside className="hidden sm:flex flex-col items-center w-20 py-6 border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 z-20">
-          <div className="mb-8 p-2 bg-indigo-600 rounded-xl shadow-lg shadow-indigo-500/30">
-             <Radio className="w-8 h-8 text-white animate-pulse" />
-          </div>
+          <div className="mb-8 p-2 bg-indigo-600 rounded-xl shadow-lg shadow-indigo-500/30"><Radio className="w-8 h-8 text-white animate-pulse" /></div>
           <nav className="flex-1 flex flex-col gap-4 w-full px-2">
              <NavButton icon={Phone} label="Dialer" active={activeView === 'dialer'} onClick={() => setActiveView('dialer')} />
              <NavButton icon={Users} label="Contacts" active={activeView === 'contacts'} onClick={() => setActiveView('contacts')} />
-             {currentUser?.role === 'admin' && (
-                <NavButton icon={Shield} label="Admin" active={activeView === 'admin'} onClick={() => setActiveView('admin')} />
-             )}
+             {currentUser?.role === 'admin' && <NavButton icon={Shield} label="Admin" active={activeView === 'admin'} onClick={() => setActiveView('admin')} />}
              <NavButton icon={Settings} label="Settings" active={activeView === 'settings'} onClick={() => setActiveView('settings')} />
           </nav>
           <div className="mt-auto flex flex-col gap-4 items-center">
              <div className="w-10 h-10 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center font-bold text-xs relative group cursor-pointer" title={currentUser?.name}>
-                {currentUser?.avatar || '?'}
-                <div className="absolute bottom-0 right-0">
-                   <StatusIndicator status={status} />
-                </div>
+                {currentUser?.avatar || '?'}<div className="absolute bottom-0 right-0"><StatusIndicator status={status} /></div>
              </div>
-             <button onClick={handleLogout} className="text-slate-400 hover:text-rose-500 transition-colors p-2">
-                <LogOut className="w-6 h-6" />
-             </button>
+             <button onClick={handleLogout} className="text-slate-400 hover:text-rose-500 transition-colors p-2"><LogOut className="w-6 h-6" /></button>
           </div>
        </aside>
 
        <main className="flex-1 flex flex-col relative overflow-hidden">
-          {/* Mobile Header */}
           <header className="sm:hidden h-16 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-4 bg-white dark:bg-slate-950 z-20">
-             <div className="flex items-center gap-2">
-                <Radio className="w-6 h-6 text-indigo-600" />
-                <span className="font-bold text-lg tracking-tight">SiteOS</span>
-             </div>
-             <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center font-bold text-xs relative">
-                {currentUser?.avatar}
-                <div className="absolute bottom-0 right-0">
-                   <StatusIndicator status={status} />
-                </div>
-             </div>
+             <div className="flex items-center gap-2"><Radio className="w-6 h-6 text-indigo-600" /><span className="font-bold text-lg tracking-tight">SiteOS</span></div>
+             <div className="w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center font-bold text-xs relative">{currentUser?.avatar}<div className="absolute bottom-0 right-0"><StatusIndicator status={status} /></div></div>
           </header>
 
           <div className="flex-1 overflow-hidden relative">
-             {activeView === 'dialer' && (
-                <DialerView 
-                   dialString={dialString}
-                   setDialString={setDialString}
-                   handleCallStart={handleCallStart}
-                   deviceReady={deviceReady}
-                   activeView={activeView}
-                   setActiveView={setActiveView}
-                   history={callHistory}
-                   clearHistory={clearHistory}
-                   retryConnection={() => fetchTwilioToken(currentUser?.name || '')}
-                />
-             )}
-             
-             {activeView === 'contacts' && currentUser && (
-                <ContactsView 
-                   user={currentUser}
-                   setDialString={setDialString}
-                   setActiveView={setActiveView}
-                />
-             )}
-
-             {activeView === 'admin' && (
-                <AdminView 
-                   setGeneratedQrToken={setGeneratedQrToken}
-                   generatedQrToken={generatedQrToken}
-                   routingRules={routingRules}
-                   setRoutingRules={setRoutingRules}
-                   systemConfig={systemConfig}
-                   setSystemConfig={setSystemConfig}
-                />
-             )}
-
-             {activeView === 'settings' && currentUser && (
-                <SettingsView 
-                   user={currentUser}
-                   handleLogout={handleLogout}
-                   setTwilioToken={setTwilioToken}
-                   inputDevices={inputDevices}
-                   outputDevices={outputDevices}
-                   setAudioInput={setAudioInput}
-                   setAudioOutput={setAudioOutput}
-                   refreshDevices={getDevices}
-                   geoState={{location, isWithinFence}}
-                   systemConfig={systemConfig}
-                   setSystemConfig={setSystemConfig}
-                   isDeviceReady={deviceReady}
-                   onRefreshConnection={fetchTwilioToken}
-                />
-             )}
-
-             {activeView === 'setup' && (
-                <SetupView 
-                   generateSetupLink={() => {}}
-                   generatedQrToken={null}
-                   setGeneratedQrToken={setGeneratedQrToken}
-                />
-             )}
-             
-             {activeView === 'guest-kiosk' && (
-                <GuestKioskView 
-                   handleCallStart={handleCallStart}
-                   setDialString={setDialString}
-                   emergencyNumber={systemConfig.emergencyNumber}
-                />
-             )}
+             {activeView === 'dialer' && <DialerView dialString={dialString} setDialString={setDialString} handleCallStart={handleCallStart} deviceReady={deviceReady} activeView={activeView} setActiveView={setActiveView} history={callHistory} clearHistory={clearHistory} retryConnection={() => fetchTwilioToken(currentUser?.name || '')} error={voiceError} />}
+             {activeView === 'contacts' && currentUser && <ContactsView user={currentUser} setDialString={setDialString} setActiveView={setActiveView} />}
+             {activeView === 'admin' && <AdminView setGeneratedQrToken={setGeneratedQrToken} generatedQrToken={generatedQrToken} routingRules={routingRules} setRoutingRules={setRoutingRules} systemConfig={systemConfig} setSystemConfig={setSystemConfig} />}
+             {activeView === 'settings' && currentUser && <SettingsView user={currentUser} handleLogout={handleLogout} setTwilioToken={setTwilioToken} inputDevices={inputDevices} outputDevices={outputDevices} setAudioInput={handleSetAudioInput} setAudioOutput={handleSetAudioOutput} selectedMic={selectedMic} selectedSpeaker={selectedSpeaker} refreshDevices={getDevices} geoState={{location, isWithinFence}} systemConfig={systemConfig} setSystemConfig={setSystemConfig} isDeviceReady={deviceReady} onRefreshConnection={fetchTwilioToken} lastError={voiceError} />}
+             {activeView === 'setup' && <SetupView generateSetupLink={() => {}} generatedQrToken={null} setGeneratedQrToken={setGeneratedQrToken} />}
+             {activeView === 'guest-kiosk' && <GuestKioskView handleCallStart={handleCallStart} setDialString={setDialString} emergencyNumber={systemConfig.emergencyNumber} />}
           </div>
 
-          {/* ... Modals (Call Overlay, Incoming, Toast) ... */}
           {callState === 'incoming' && incomingConnection && (
              <div className="absolute inset-0 z-50 bg-slate-900/90 backdrop-blur-md flex flex-col items-center justify-center animate-in fade-in zoom-in duration-300">
-                <div className="w-32 h-32 rounded-full bg-white/10 flex items-center justify-center mb-8 animate-pulse">
-                   <PhoneIncoming className="w-16 h-16 text-white" />
-                </div>
-                <h2 className="text-3xl font-bold text-white mb-2">{incomingConnection.parameters.From || 'Unknown Caller'}</h2>
-                <p className="text-indigo-300 mb-12 animate-pulse">Incoming Call...</p>
-                <div className="flex gap-8">
-                   <button onClick={rejectCall} className="w-20 h-20 rounded-full bg-rose-500 hover:bg-rose-600 flex items-center justify-center text-white transition-transform hover:scale-110 shadow-lg shadow-rose-500/40">
-                      <PhoneOff className="w-8 h-8" />
-                   </button>
-                   <button onClick={acceptCall} className="w-20 h-20 rounded-full bg-emerald-500 hover:bg-emerald-600 flex items-center justify-center text-white transition-transform hover:scale-110 shadow-lg shadow-emerald-500/40 animate-bounce">
-                      <Phone className="w-8 h-8" />
-                   </button>
-                </div>
+                <div className="w-32 h-32 rounded-full bg-white/10 flex items-center justify-center mb-8 animate-pulse"><PhoneIncoming className="w-16 h-16 text-white" /></div>
+                <h2 className="text-3xl font-bold text-white mb-2">{incomingConnection.parameters.From || 'Unknown Caller'}</h2><p className="text-indigo-300 mb-12 animate-pulse">Incoming Call...</p>
+                <div className="flex gap-8"><button onClick={rejectCall} className="w-20 h-20 rounded-full bg-rose-500 hover:bg-rose-600 flex items-center justify-center text-white transition-transform hover:scale-110 shadow-lg shadow-rose-500/40"><PhoneOff className="w-8 h-8" /></button><button onClick={acceptCall} className="w-20 h-20 rounded-full bg-emerald-500 hover:bg-emerald-600 flex items-center justify-center text-white transition-transform hover:scale-110 shadow-lg shadow-emerald-500/40 animate-bounce"><Phone className="w-8 h-8" /></button></div>
              </div>
           )}
 
           {callState === 'connected' && (
              <div className="absolute bottom-0 left-0 right-0 bg-indigo-600 text-white p-4 z-40 flex items-center justify-between shadow-2xl animate-in slide-in-from-bottom">
-                 <div className="flex items-center gap-4">
-                    <div className="w-12 h-12 rounded-full bg-white/20 flex items-center justify-center animate-pulse">
-                       <Activity className="w-6 h-6" />
-                    </div>
-                    <div>
-                       <h3 className="font-bold text-lg">Connected</h3>
-                       <p className="text-indigo-200 font-mono">{formatDuration(callDuration)}</p>
-                    </div>
-                 </div>
-                 <div className="flex items-center gap-4">
-                    <button className="p-3 rounded-full hover:bg-white/10 transition-colors"><MicOff className="w-6 h-6" /></button>
-                    <button onClick={endCall} className="p-4 rounded-full bg-rose-500 hover:bg-rose-600 transition-colors shadow-lg">
-                       <PhoneOff className="w-6 h-6" />
-                    </button>
-                 </div>
+                 <div className="flex items-center gap-4"><div className="w-12 h-12 rounded-full bg-white/20 flex items-center justify-center animate-pulse"><Activity className="w-6 h-6" /></div><div><h3 className="font-bold text-lg">Connected</h3><p className="text-indigo-200 font-mono">{formatDuration(callDuration)}</p></div></div>
+                 <div className="flex items-center gap-4"><button className="p-3 rounded-full hover:bg-white/10 transition-colors"><MicOff className="w-6 h-6" /></button><button onClick={endCall} className="p-4 rounded-full bg-rose-500 hover:bg-rose-600 transition-colors shadow-lg"><PhoneOff className="w-6 h-6" /></button></div>
              </div>
           )}
 
           <nav className="sm:hidden h-20 bg-white dark:bg-slate-950 border-t border-slate-200 dark:border-slate-800 flex items-center justify-around px-2 z-20">
              <NavButton icon={Phone} label="Keypad" active={activeView === 'dialer'} onClick={() => setActiveView('dialer')} mobile />
              <NavButton icon={Users} label="Contacts" active={activeView === 'contacts'} onClick={() => setActiveView('contacts')} mobile />
-             {currentUser?.role === 'admin' && (
-               <NavButton icon={Shield} label="Admin" active={activeView === 'admin'} onClick={() => setActiveView('admin')} mobile />
-             )}
+             {currentUser?.role === 'admin' && <NavButton icon={Shield} label="Admin" active={activeView === 'admin'} onClick={() => setActiveView('admin')} mobile />}
              <NavButton icon={Settings} label="Settings" active={activeView === 'settings'} onClick={() => setActiveView('settings')} mobile />
           </nav>
           
           {toast && (
              <div className={`fixed top-4 left-1/2 -translate-x-1/2 px-6 py-3 rounded-full shadow-xl z-[70] animate-in slide-in-from-top-4 fade-in flex items-center gap-2 font-bold text-sm ${toast.type === 'success' ? 'bg-emerald-500 text-white' : toast.type === 'error' ? 'bg-rose-500 text-white' : 'bg-slate-800 text-white'}`}>
-                {toast.type === 'success' ? <CheckCircle2 className="w-4 h-4"/> : toast.type === 'error' ? <AlertCircle className="w-4 h-4"/> : <Info className="w-4 h-4"/>}
-                {toast.msg}
+                {toast.type === 'success' ? <CheckCircle2 className="w-4 h-4"/> : toast.type === 'error' ? <AlertCircle className="w-4 h-4"/> : <Info className="w-4 h-4"/>}{toast.msg}
              </div>
           )}
        </main>
